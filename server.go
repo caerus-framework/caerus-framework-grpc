@@ -16,6 +16,7 @@ import (
 	cf_logs "github.com/caerus-framework/caerus-framework-logs"
 	cf_observability "github.com/caerus-framework/caerus-framework-observability"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -46,6 +47,10 @@ type ServerConfig struct {
 	KeepaliveTimeoutSec  *float64      `json:"keepalive_timeout_sec,omitempty" yaml:"keepalive_timeout_sec,omitempty" env:"KEEPALIVE_TIMEOUT_SEC"`
 	MaxConnectionIdleSec *float64      `json:"max_connection_idle_sec,omitempty" yaml:"max_connection_idle_sec,omitempty" env:"MAX_CONNECTION_IDLE_SEC"`
 	RestartPolicy        RestartPolicy `json:"restart_policy,omitempty" yaml:"restart_policy,omitempty" env:"RESTART_POLICY"`
+	TLSCAFile            string        `json:"tls_ca_file,omitempty" yaml:"tls_ca_file,omitempty" env:"TLS_CA_FILE"`
+	TLSCertFile          string        `json:"tls_cert_file,omitempty" yaml:"tls_cert_file,omitempty" env:"TLS_CERT_FILE"`
+	TLSKeyFile           string        `json:"tls_key_file,omitempty" yaml:"tls_key_file,omitempty" env:"TLS_KEY_FILE"`
+	TLSClientAuth        string        `json:"tls_client_auth,omitempty" yaml:"tls_client_auth,omitempty" env:"TLS_CLIENT_AUTH"`
 }
 
 // ServerOption configures a Server at construction time.
@@ -64,6 +69,10 @@ type serverOptions struct {
 	keepaliveTimeout  time.Duration
 	maxConnectionIdle time.Duration
 	restartPolicy     RestartPolicy
+	tlsCAFile         string
+	tlsCertFile       string
+	tlsKeyFile        string
+	tlsClientAuth     TLSClientAuth
 	logger            *slog.Logger
 	loggerSet         bool
 	name              string
@@ -112,6 +121,26 @@ func WithShutdownTimeout(d time.Duration) ServerOption {
 	return func(o *serverOptions) { o.shutdownTimeout = d }
 }
 
+// WithServerTLS sets the server certificate and key (PEM paths).
+// Optional CA + tls_client_auth=require_and_verify enables mTLS.
+func WithServerTLS(certFile, keyFile string) ServerOption {
+	return func(o *serverOptions) {
+		o.tlsCertFile = certFile
+		o.tlsKeyFile = keyFile
+	}
+}
+
+// WithServerTLSClientCA sets the CA used to verify client certificates (mTLS).
+// Defaults tls_client_auth to require_and_verify when unset.
+func WithServerTLSClientCA(caFile string) ServerOption {
+	return func(o *serverOptions) {
+		o.tlsCAFile = caFile
+		if o.tlsClientAuth == "" || o.tlsClientAuth == TLSClientAuthNone {
+			o.tlsClientAuth = TLSClientAuthRequireAndVerify
+		}
+	}
+}
+
 // Server owns one gRPC listen/serve lifecycle for app-registered services.
 type Server struct {
 	mu sync.Mutex
@@ -128,6 +157,10 @@ type Server struct {
 	keepaliveTimeout  time.Duration
 	maxConnectionIdle time.Duration
 	restartPolicy     RestartPolicy
+	tlsCAFile         string
+	tlsCertFile       string
+	tlsKeyFile        string
+	tlsClientAuth     TLSClientAuth
 
 	name      string
 	logger    *slog.Logger
@@ -160,6 +193,7 @@ func NewServer(opts ...ServerOption) *Server {
 		keepaliveTimeout:  20 * time.Second,
 		maxConnectionIdle: 15 * time.Minute,
 		restartPolicy:     RestartPolicyHandled,
+		tlsClientAuth:     TLSClientAuthNone,
 		logger:            slog.Default(),
 	}
 	for _, opt := range opts {
@@ -177,6 +211,10 @@ func NewServer(opts ...ServerOption) *Server {
 		keepaliveTimeout:  o.keepaliveTimeout,
 		maxConnectionIdle: o.maxConnectionIdle,
 		restartPolicy:     o.restartPolicy,
+		tlsCAFile:         o.tlsCAFile,
+		tlsCertFile:       o.tlsCertFile,
+		tlsKeyFile:        o.tlsKeyFile,
+		tlsClientAuth:     o.tlsClientAuth,
 		name:              o.name,
 		logger:            o.logger,
 		loggerSet:         o.loggerSet,
@@ -252,9 +290,14 @@ func (s *Server) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 		s.unsubscribeLogs()
 		return errors.New("cf_grpc: server bind is required")
 	}
-	s.grpcServer = grpc.NewServer(s.serverOptionsLocked()...)
+	opts, err := s.serverOptionsLocked()
+	if err != nil {
+		s.unsubscribeLogs()
+		return err
+	}
+	s.grpcServer = grpc.NewServer(opts...)
 	s.initialized = true
-	s.logger.Info("cf_grpc: server initialized", "bind", s.bind)
+	s.logger.Info("cf_grpc: server initialized", "bind", s.bind, "tls", s.tlsCertFile != "")
 	return nil
 }
 
@@ -397,7 +440,7 @@ func (s *Server) Run(ctx context.Context) error {
 // after a bind-changing config reload.
 var ErrServerRestartRequired = errors.New("cf_grpc: server settings changed; immediate restart requested")
 
-// OnConfigReload implements cf.ConfigReloader. Bind changes do not rebind live.
+// OnConfigReload implements cf.ConfigReloader. Bind/TLS changes do not rebind live.
 func (s *Server) OnConfigReload(source string, cfg any) {
 	if source != s.configSource {
 		return
@@ -413,21 +456,22 @@ func (s *Server) OnConfigReload(source string, cfg any) {
 		return
 	}
 	bindChanged := loaded.Bind != "" && loaded.Bind != s.bind
+	tlsChanged := serverTLSConfigChanged(s, loaded)
 	if loaded.RestartPolicy != "" {
 		s.restartPolicy = loaded.RestartPolicy
 	}
 	if loaded.ShutdownTimeoutSec != nil {
 		s.shutdownTimeout = time.Duration(*loaded.ShutdownTimeoutSec * float64(time.Second))
 	}
-	if bindChanged {
+	if bindChanged || tlsChanged {
 		switch s.restartPolicy {
 		case RestartPolicyImmediate:
 			s.restartRequired.Store(true)
 			s.restartRequested.Store(true)
 			cancel := s.runCancel
 			s.mu.Unlock()
-			s.logger.Error("cf_grpc: server bind changed; restart_policy=immediate — stopping so the process can rebind",
-				"source", source, "bind", loaded.Bind)
+			s.logger.Error("cf_grpc: server listen/TLS settings changed; restart_policy=immediate — stopping so the process can rebind",
+				"source", source, "bind", loaded.Bind, "tls_changed", tlsChanged)
 			if cancel != nil {
 				cancel()
 			}
@@ -435,8 +479,8 @@ func (s *Server) OnConfigReload(source string, cfg any) {
 			return
 		default:
 			s.restartRequired.Store(true)
-			s.logger.Error("cf_grpc: server bind changed; restart required — current listener stays until a new process rebinds",
-				"source", source, "bind", loaded.Bind)
+			s.logger.Error("cf_grpc: server listen/TLS settings changed; restart required — current listener stays until a new process rebinds",
+				"source", source, "bind", loaded.Bind, "tls_changed", tlsChanged)
 		}
 	}
 	s.mu.Unlock()
@@ -542,16 +586,58 @@ func (s *Server) applyServerConfig(cfg ServerConfig) {
 	if cfg.RestartPolicy != "" {
 		s.restartPolicy = cfg.RestartPolicy
 	}
+	if cfg.TLSCAFile != "" {
+		s.tlsCAFile = cfg.TLSCAFile
+	}
+	if cfg.TLSCertFile != "" || cfg.TLSKeyFile != "" {
+		s.tlsCertFile = cfg.TLSCertFile
+		s.tlsKeyFile = cfg.TLSKeyFile
+	}
+	if cfg.TLSClientAuth != "" {
+		if auth, err := normalizeTLSClientAuth(cfg.TLSClientAuth); err == nil {
+			s.tlsClientAuth = auth
+		}
+	} else if s.tlsCAFile != "" && (s.tlsClientAuth == "" || s.tlsClientAuth == TLSClientAuthNone) {
+		s.tlsClientAuth = TLSClientAuthRequireAndVerify
+	}
 }
 
-func (s *Server) serverOptionsLocked() []grpc.ServerOption {
-	return []grpc.ServerOption{
+func serverTLSConfigChanged(s *Server, cfg *ServerConfig) bool {
+	ca, cert, key := s.tlsCAFile, s.tlsCertFile, s.tlsKeyFile
+	if cfg.TLSCAFile != "" {
+		ca = cfg.TLSCAFile
+	}
+	if cfg.TLSCertFile != "" || cfg.TLSKeyFile != "" {
+		cert, key = cfg.TLSCertFile, cfg.TLSKeyFile
+	}
+	if !tlsFilesEqual(s.tlsCAFile, s.tlsCertFile, s.tlsKeyFile, ca, cert, key) {
+		return true
+	}
+	if cfg.TLSClientAuth != "" {
+		auth, err := normalizeTLSClientAuth(cfg.TLSClientAuth)
+		if err == nil && auth != s.tlsClientAuth {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) serverOptionsLocked() ([]grpc.ServerOption, error) {
+	opts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			MaxConnectionIdle: s.maxConnectionIdle,
 			Time:              s.keepaliveTime,
 			Timeout:           s.keepaliveTimeout,
 		}),
 	}
+	if s.tlsCertFile != "" || s.tlsKeyFile != "" {
+		tlsCfg, err := buildServerTLSConfig(s.tlsCAFile, s.tlsCertFile, s.tlsKeyFile, s.tlsClientAuth)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+	}
+	return opts, nil
 }
 
 func validateServerConfig(cfg *ServerConfig) error {
@@ -572,6 +658,25 @@ func validateServerConfig(cfg *ServerConfig) error {
 	default:
 		return fmt.Errorf("cf_grpc: unknown restart_policy %q (want %q or %q)",
 			cfg.RestartPolicy, RestartPolicyHandled, RestartPolicyImmediate)
+	}
+	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
+		return errors.New("cf_grpc: tls_cert_file and tls_key_file must be set together")
+	}
+	auth, err := normalizeTLSClientAuth(cfg.TLSClientAuth)
+	if err != nil {
+		return err
+	}
+	if cfg.TLSCAFile != "" && cfg.TLSClientAuth == "" {
+		auth = TLSClientAuthRequireAndVerify
+	}
+	if auth == TLSClientAuthRequireAndVerify && cfg.TLSCAFile == "" {
+		return errors.New("cf_grpc: tls_client_auth=require_and_verify needs tls_ca_file")
+	}
+	if cfg.TLSCAFile != "" && auth == TLSClientAuthNone && cfg.TLSClientAuth != "" {
+		return errors.New("cf_grpc: tls_ca_file set but tls_client_auth is none")
+	}
+	if cfg.TLSCertFile == "" && cfg.TLSCAFile != "" {
+		return errors.New("cf_grpc: tls_ca_file requires tls_cert_file and tls_key_file")
 	}
 	return nil
 }

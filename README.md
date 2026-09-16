@@ -128,7 +128,11 @@ Env overlay uses the source’s prefix (default from source name:
 | `keepalive_time_sec` | tunable | `7200` (2h) | Server keepalive ping period (gRPC `ServerParameters.Time`). |
 | `keepalive_timeout_sec` | tunable | `20` | Wait for keepalive ping ack before closing the connection. |
 | `max_connection_idle_sec` | tunable | `900` (15m) | Close connections idle longer than this (gRPC `MaxConnectionIdle`). |
-| `restart_policy` | setting | `handled` | What happens if `bind` changes on reload: `handled` (log “restart required”, keep current listener) or `immediate` (`Run` returns so the process can exit and rebind). **No live rebind.** |
+| `restart_policy` | setting | `handled` | What happens if `bind` or TLS paths change on reload: `handled` (log “restart required”, keep current listener) or `immediate` (`Run` returns so the process can exit and rebind). **No live rebind.** |
+| `tls_cert_file` | setting | _(empty)_ | Server certificate PEM path. Set with `tls_key_file` to enable TLS. |
+| `tls_key_file` | setting | _(empty)_ | Server private key PEM path (pair with `tls_cert_file`). |
+| `tls_ca_file` | setting | _(empty)_ | CA PEM to verify **client** certificates (mTLS). When set without `tls_client_auth`, defaults to `require_and_verify`. |
+| `tls_client_auth` | setting | `none` | `none` (no client cert) or `require_and_verify` (mTLS; needs `tls_ca_file`). |
 
 Example `config/grpc-public.json`:
 
@@ -151,6 +155,12 @@ Example `config/grpc-public.json`:
 | `keepalive_timeout_sec` | tunable | `1` | Wait for keepalive ping ack. |
 | `degraded_mode` | switch | `false` | When true, failed dial / Ready wait does **not** abort `Init` (hard-fail when off). Same idea as `cf_valkey`. |
 | `health_when_degraded` | setting | `not_ready` | While disconnected under DegradedMode: `not_ready` (`Health` fails → `/readyz` 503) or `ready` (break-glass LB traffic). |
+| `tls_ca_file` | setting | _(empty)_ | CA PEM to verify the **server** certificate. Empty + `insecure: false` uses system roots. |
+| `tls_cert_file` / `tls_key_file` | setting | _(empty)_ | Client certificate pair for mTLS (must be set together). |
+| `tls_server_name` | setting | _(empty)_ | TLS ServerName (SNI / hostname check). Often needed when dialing by IP. |
+| `tls_insecure_skip_verify` | switch | `false` | Skip server cert verify (lab only). |
+
+**Plaintext vs TLS (client):** default `insecure: true` is local plaintext. For TLS set `insecure: false` (and usually `tls_ca_file`), or set TLS PEM paths (that alone flips to secure dial unless `insecure: true` is set explicitly — which is rejected).
 
 Example — local process (laptop / `go run`):
 
@@ -195,6 +205,11 @@ Client **DegradedMode** matches
 | `WithServerName` / `WithClientName` | both | component `Name()` |
 | `WithServerLogger` / `WithClientLogger` | both | explicit logger |
 | `WithClientDegradedMode` | client | soft Init on dial failure |
+| `WithClientTLS` | client | PEM CA / optional client cert+key; sets secure dial |
+| `WithTLSServerName` | client | SNI / cert hostname |
+| `WithTLSInsecureSkipVerify` | client | lab-only skip verify |
+| `WithServerTLS` | server | PEM cert+key |
+| `WithServerTLSClientCA` | server | mTLS client CA (+ require_and_verify) |
 | `WithConnectTimeout` | client | Ready wait |
 | `WithShutdownTimeout` | server | GracefulStop deadline |
 

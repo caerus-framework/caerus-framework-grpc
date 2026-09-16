@@ -21,6 +21,7 @@ import (
 	cf_observability "github.com/caerus-framework/caerus-framework-observability"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
@@ -36,35 +37,45 @@ const (
 // No field flag tags: multiple clients share a process flag namespace; use
 // per-source EnvPrefix and the --<source-name> path override instead.
 type ClientConfig struct {
-	Target              string   `json:"target,omitempty" yaml:"target,omitempty" env:"TARGET"`
-	Insecure            *bool    `json:"insecure,omitempty" yaml:"insecure,omitempty" env:"INSECURE"`
-	ConnectTimeoutSec   *float64 `json:"connect_timeout_sec,omitempty" yaml:"connect_timeout_sec,omitempty" env:"CONNECT_TIMEOUT_SEC"`
-	KeepaliveTimeSec    *float64 `json:"keepalive_time_sec,omitempty" yaml:"keepalive_time_sec,omitempty" env:"KEEPALIVE_TIME_SEC"`
-	KeepaliveTimeoutSec *float64 `json:"keepalive_timeout_sec,omitempty" yaml:"keepalive_timeout_sec,omitempty" env:"KEEPALIVE_TIMEOUT_SEC"`
-	DegradedMode        *bool    `json:"degraded_mode,omitempty" yaml:"degraded_mode,omitempty" env:"DEGRADED_MODE"`
-	HealthWhenDegraded  string   `json:"health_when_degraded,omitempty" yaml:"health_when_degraded,omitempty" env:"HEALTH_WHEN_DEGRADED"`
+	Target                string   `json:"target,omitempty" yaml:"target,omitempty" env:"TARGET"`
+	Insecure              *bool    `json:"insecure,omitempty" yaml:"insecure,omitempty" env:"INSECURE"`
+	ConnectTimeoutSec     *float64 `json:"connect_timeout_sec,omitempty" yaml:"connect_timeout_sec,omitempty" env:"CONNECT_TIMEOUT_SEC"`
+	KeepaliveTimeSec      *float64 `json:"keepalive_time_sec,omitempty" yaml:"keepalive_time_sec,omitempty" env:"KEEPALIVE_TIME_SEC"`
+	KeepaliveTimeoutSec   *float64 `json:"keepalive_timeout_sec,omitempty" yaml:"keepalive_timeout_sec,omitempty" env:"KEEPALIVE_TIMEOUT_SEC"`
+	DegradedMode          *bool    `json:"degraded_mode,omitempty" yaml:"degraded_mode,omitempty" env:"DEGRADED_MODE"`
+	HealthWhenDegraded    string   `json:"health_when_degraded,omitempty" yaml:"health_when_degraded,omitempty" env:"HEALTH_WHEN_DEGRADED"`
+	TLSCAFile             string   `json:"tls_ca_file,omitempty" yaml:"tls_ca_file,omitempty" env:"TLS_CA_FILE"`
+	TLSCertFile           string   `json:"tls_cert_file,omitempty" yaml:"tls_cert_file,omitempty" env:"TLS_CERT_FILE"`
+	TLSKeyFile            string   `json:"tls_key_file,omitempty" yaml:"tls_key_file,omitempty" env:"TLS_KEY_FILE"`
+	TLSServerName         string   `json:"tls_server_name,omitempty" yaml:"tls_server_name,omitempty" env:"TLS_SERVER_NAME"`
+	TLSInsecureSkipVerify *bool    `json:"tls_insecure_skip_verify,omitempty" yaml:"tls_insecure_skip_verify,omitempty" env:"TLS_INSECURE_SKIP_VERIFY"`
 }
 
 // ClientOption configures a Client at construction time.
 type ClientOption func(*clientOptions)
 
 type clientOptions struct {
-	loaded             *ClientConfig
-	configSource       string
-	configPath         string
-	srcEnvPrefix       string
-	srcFormat          cf_configuration.Format
-	srcFormatSet       bool
-	target             string
-	insecure           bool
-	connectTimeout     time.Duration
-	keepaliveTime      time.Duration
-	keepaliveTimeout   time.Duration
-	degradedMode       bool
-	healthWhenDegraded string
-	logger             *slog.Logger
-	loggerSet          bool
-	name               string
+	loaded                *ClientConfig
+	configSource          string
+	configPath            string
+	srcEnvPrefix          string
+	srcFormat             cf_configuration.Format
+	srcFormatSet          bool
+	target                string
+	insecure              bool
+	connectTimeout        time.Duration
+	keepaliveTime         time.Duration
+	keepaliveTimeout      time.Duration
+	degradedMode          bool
+	healthWhenDegraded    string
+	tlsCAFile             string
+	tlsCertFile           string
+	tlsKeyFile            string
+	tlsServerName         string
+	tlsInsecureSkipVerify bool
+	logger                *slog.Logger
+	loggerSet             bool
+	name                  string
 }
 
 // WithClientConfig applies a static configuration snapshot.
@@ -92,9 +103,32 @@ func WithTarget(target string) ClientOption {
 	return func(o *clientOptions) { o.target = target }
 }
 
-// WithInsecure uses insecure transport credentials (default true for local v1).
+// WithInsecure uses plaintext credentials (default true for local use).
+// Cannot be combined with TLS files; set false for TLS (system roots and/or PEM).
 func WithInsecure(enabled bool) ClientOption {
 	return func(o *clientOptions) { o.insecure = enabled }
+}
+
+// WithClientTLS configures PEM paths for TLS (and optional mTLS).
+// CA verifies the server; cert+key are a pair for client authentication.
+// Sets insecure to false (secure dial).
+func WithClientTLS(caFile, certFile, keyFile string) ClientOption {
+	return func(o *clientOptions) {
+		o.tlsCAFile = caFile
+		o.tlsCertFile = certFile
+		o.tlsKeyFile = keyFile
+		o.insecure = false
+	}
+}
+
+// WithTLSServerName sets the TLS ServerName (SNI / cert hostname check).
+func WithTLSServerName(name string) ClientOption {
+	return func(o *clientOptions) { o.tlsServerName = name }
+}
+
+// WithTLSInsecureSkipVerify skips server certificate verification (lab only).
+func WithTLSInsecureSkipVerify(skip bool) ClientOption {
+	return func(o *clientOptions) { o.tlsInsecureSkipVerify = skip }
 }
 
 // WithConnectTimeout sets how long Init waits for connectivity.Ready.
@@ -130,13 +164,18 @@ type Client struct {
 	srcFormat    cf_configuration.Format
 	srcFormatSet bool
 
-	target             string
-	insecure           bool
-	connectTimeout     time.Duration
-	keepaliveTime      time.Duration
-	keepaliveTimeout   time.Duration
-	degradedMode       bool
-	healthWhenDegraded string
+	target                string
+	insecure              bool
+	connectTimeout        time.Duration
+	keepaliveTime         time.Duration
+	keepaliveTimeout      time.Duration
+	degradedMode          bool
+	healthWhenDegraded    string
+	tlsCAFile             string
+	tlsCertFile           string
+	tlsKeyFile            string
+	tlsServerName         string
+	tlsInsecureSkipVerify bool
 
 	name      string
 	logger    *slog.Logger
@@ -169,21 +208,26 @@ func NewClient(opts ...ClientOption) *Client {
 		opt(&o)
 	}
 	c := &Client{
-		configSource:       o.configSource,
-		configPath:         o.configPath,
-		srcEnvPrefix:       o.srcEnvPrefix,
-		srcFormat:          o.srcFormat,
-		srcFormatSet:       o.srcFormatSet,
-		target:             o.target,
-		insecure:           o.insecure,
-		connectTimeout:     o.connectTimeout,
-		keepaliveTime:      o.keepaliveTime,
-		keepaliveTimeout:   o.keepaliveTimeout,
-		degradedMode:       o.degradedMode,
-		healthWhenDegraded: normalizeHealthWhenDegraded(o.healthWhenDegraded),
-		name:               o.name,
-		logger:             o.logger,
-		loggerSet:          o.loggerSet,
+		configSource:          o.configSource,
+		configPath:            o.configPath,
+		srcEnvPrefix:          o.srcEnvPrefix,
+		srcFormat:             o.srcFormat,
+		srcFormatSet:          o.srcFormatSet,
+		target:                o.target,
+		insecure:              o.insecure,
+		connectTimeout:        o.connectTimeout,
+		keepaliveTime:         o.keepaliveTime,
+		keepaliveTimeout:      o.keepaliveTimeout,
+		degradedMode:          o.degradedMode,
+		healthWhenDegraded:    normalizeHealthWhenDegraded(o.healthWhenDegraded),
+		tlsCAFile:             o.tlsCAFile,
+		tlsCertFile:           o.tlsCertFile,
+		tlsKeyFile:            o.tlsKeyFile,
+		tlsServerName:         o.tlsServerName,
+		tlsInsecureSkipVerify: o.tlsInsecureSkipVerify,
+		name:                  o.name,
+		logger:                o.logger,
+		loggerSet:             o.loggerSet,
 	}
 	c.facade = &liveConn{c: c}
 	if o.loaded != nil {
@@ -464,26 +508,58 @@ func (c *Client) applyClientConfig(cfg ClientConfig) {
 	if cfg.HealthWhenDegraded != "" {
 		c.healthWhenDegraded = normalizeHealthWhenDegraded(cfg.HealthWhenDegraded)
 	}
+	if cfg.TLSCAFile != "" {
+		c.tlsCAFile = cfg.TLSCAFile
+	}
+	if cfg.TLSCertFile != "" || cfg.TLSKeyFile != "" {
+		c.tlsCertFile = cfg.TLSCertFile
+		c.tlsKeyFile = cfg.TLSKeyFile
+	}
+	if cfg.TLSServerName != "" {
+		c.tlsServerName = cfg.TLSServerName
+	}
+	if cfg.TLSInsecureSkipVerify != nil {
+		c.tlsInsecureSkipVerify = *cfg.TLSInsecureSkipVerify
+	}
+	hasTLSFiles := c.tlsCAFile != "" || c.tlsCertFile != "" || c.tlsKeyFile != ""
+	if hasTLSFiles && cfg.Insecure == nil {
+		c.insecure = false
+	}
 }
 
 func (c *Client) dialLocked() (*grpc.ClientConn, error) {
+	creds, err := c.transportCredentials()
+	if err != nil {
+		return nil, err
+	}
 	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(creds),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                c.keepaliveTime,
 			Timeout:             c.keepaliveTimeout,
 			PermitWithoutStream: true,
 		}),
 	}
-	if c.insecure {
-		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	} else {
-		return nil, errors.New("cf_grpc: secure dial not implemented yet; set insecure: true or WithInsecure(true)")
-	}
 	conn, err := grpc.NewClient(c.target, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("cf_grpc: dial %s: %w", c.target, err)
 	}
 	return conn, nil
+}
+
+func (c *Client) transportCredentials() (credentials.TransportCredentials, error) {
+	hasTLSFiles := c.tlsCAFile != "" || c.tlsCertFile != "" || c.tlsKeyFile != ""
+	if c.insecure {
+		if hasTLSFiles {
+			return nil, errors.New("cf_grpc: insecure true cannot be combined with TLS files; set insecure: false")
+		}
+		return insecure.NewCredentials(), nil
+	}
+	cfg, err := buildClientTLSConfig(c.tlsCAFile, c.tlsCertFile, c.tlsKeyFile, c.tlsServerName, c.tlsInsecureSkipVerify)
+	if err != nil {
+		return nil, err
+	}
+	return credentials.NewTLS(cfg), nil
 }
 
 func (c *Client) waitReadyLocked(ctx context.Context, conn *grpc.ClientConn) error {
@@ -524,6 +600,13 @@ func validateClientConfig(cfg *ClientConfig) error {
 	case "", "ready", "not_ready":
 	default:
 		return fmt.Errorf("cf_grpc: health_when_degraded must be ready or not_ready, got %q", cfg.HealthWhenDegraded)
+	}
+	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
+		return errors.New("cf_grpc: tls_cert_file and tls_key_file must be set together")
+	}
+	hasTLSFiles := cfg.TLSCAFile != "" || cfg.TLSCertFile != "" || cfg.TLSKeyFile != ""
+	if cfg.Insecure != nil && *cfg.Insecure && hasTLSFiles {
+		return errors.New("cf_grpc: insecure true cannot be combined with TLS files")
 	}
 	return nil
 }
