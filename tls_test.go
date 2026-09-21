@@ -1,6 +1,7 @@
 package cf_grpc
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -13,10 +14,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	cf "github.com/caerus-framework/caerus-framework"
+	cf_observability "github.com/caerus-framework/caerus-framework-observability"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -31,6 +34,57 @@ func TestValidateClientConfigRejectsInsecureWithTLS(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func metricNamed(t *testing.T, ms []cf_observability.Metric, name string) float64 {
+	t.Helper()
+	for _, m := range ms {
+		if m.Name == name {
+			return m.Value
+		}
+	}
+	t.Fatalf("missing metric %s", name)
+	return 0
+}
+
+func TestTLSInsecureSkipVerifyScreams(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	cli := NewClient(
+		WithTarget("127.0.0.1:1"),
+		WithInsecure(false),
+		WithTLSInsecureSkipVerify(true),
+		WithConnectTimeout(50*time.Millisecond),
+		WithClientDegradedMode(true),
+		WithClientLogger(log),
+	)
+	if err := cli.Init(context.Background(), cf.New()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Shutdown(context.Background()) })
+	if !strings.Contains(buf.String(), "tls_insecure_skip_verify is on") {
+		t.Fatalf("expected error log for skip-verify, got:\n%s", buf.String())
+	}
+	if got := metricNamed(t, cli.Metrics(), "grpc_client_tls_insecure_skip_verify"); got != 1 {
+		t.Fatalf("grpc_client_tls_insecure_skip_verify = %v, want 1", got)
+	}
+}
+
+func TestTLSInsecureSkipVerifyGaugeOff(t *testing.T) {
+	cli := NewClient(
+		WithTarget("127.0.0.1:1"),
+		WithInsecure(false),
+		WithConnectTimeout(50*time.Millisecond),
+		WithClientDegradedMode(true),
+		WithClientLogger(slog.Default()),
+	)
+	if err := cli.Init(context.Background(), cf.New()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Shutdown(context.Background()) })
+	if got := metricNamed(t, cli.Metrics(), "grpc_client_tls_insecure_skip_verify"); got != 0 {
+		t.Fatalf("grpc_client_tls_insecure_skip_verify = %v, want 0", got)
 	}
 }
 

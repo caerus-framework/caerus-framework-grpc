@@ -27,6 +27,13 @@ func TestServerDefaultName(t *testing.T) {
 	}
 }
 
+func TestServerDefaultBind(t *testing.T) {
+	s := NewServer()
+	if got := s.Addr(); got != DefaultServerBind {
+		t.Fatalf("Addr() = %q, want %q (must not collide with observability :9090)", got, DefaultServerBind)
+	}
+}
+
 func TestNamedInstances(t *testing.T) {
 	c := NewClient(WithClientName("auth"), WithTarget("127.0.0.1:1"))
 	s := NewServer(WithServerName("grpc-public"))

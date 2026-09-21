@@ -91,8 +91,8 @@ what `GetDependencies` / `GetByName` use. The configuration **source** name
 
 ```go
 logs := cf_logs.New(cf_logs.WithWriter(os.Stdout))
-srv := cf_grpc.NewServer(cf_grpc.WithBind(":9099"))
-cli := cf_grpc.NewClient(cf_grpc.WithTarget("127.0.0.1:9099"))
+srv := cf_grpc.NewServer(cf_grpc.WithBind(":8100"))
+cli := cf_grpc.NewClient(cf_grpc.WithTarget("127.0.0.1:8100"))
 fw := cf.New(&cf.FrameworkOptions{Components: []cf.CaerusComponent{logs, srv, cli}})
 ```
 
@@ -123,7 +123,7 @@ Env overlay uses the source’s prefix (default from source name:
 
 | Setting | Kind | Default | Meaning |
 | --- | --- | --- | --- |
-| `bind` | setting | `:9090` | Listen address (`host:port`). Claimed only in `Run`, never in `Init`. |
+| `bind` | setting | `:8100` | Listen address (`host:port`). Claimed only in `Run`, never in `Init`. Not `:9090` (observability) and not `:8080` (HTTP). Extra servers use `:8101`, then `:8102`. |
 | `shutdown_timeout_sec` | tunable | `10` | How long `GracefulStop` may take before hard `Stop`. |
 | `keepalive_time_sec` | tunable | `7200` (2h) | Server keepalive ping period (gRPC `ServerParameters.Time`). |
 | `keepalive_timeout_sec` | tunable | `20` | Wait for keepalive ping ack before closing the connection. |
@@ -134,22 +134,25 @@ Env overlay uses the source’s prefix (default from source name:
 | `tls_ca_file` | setting | _(empty)_ | CA PEM to verify **client** certificates (mTLS). When set without `tls_client_auth`, defaults to `require_and_verify`. |
 | `tls_client_auth` | setting | `none` | `none` (no client cert) or `require_and_verify` (mTLS; needs `tls_ca_file`). |
 
-Example `config/grpc-public.json`:
+Example `config/grpc-public.json` (plaintext listen; add TLS files for Path B):
 
 ```json
 {
-  "bind": ":9099",
+  "bind": ":8100",
   "shutdown_timeout_sec": 10,
   "restart_policy": "handled"
 }
 ```
+
+`:8100` is this module’s copy-paste default. Observability stays `:9090`.
+HTTP stays `:8080`. Do not reuse those numbers for gRPC in the same process.
 
 ### Client settings (`ClientConfig`)
 
 | Setting | Kind | Default | Meaning |
 | --- | --- | --- | --- |
 | `target` | setting | _(required)_ | Dial target (`host:port` or `dns:///name:port`). |
-| `insecure` | switch | `true` | Use insecure credentials (v1; TLS files not implemented yet). |
+| `insecure` | switch | `true` | Plaintext (h2c) credentials. Construct default is **laptop / `go run`**. Also Path A (mesh): sidecar encrypts. Path B (app TLS): `false` plus PEM / system roots. Cannot combine with TLS files. |
 | `connect_timeout_sec` | tunable | `5` | How long `Init` waits for connectivity `Ready`. |
 | `keepalive_time_sec` | tunable | `10` | Client keepalive ping period when idle. |
 | `keepalive_timeout_sec` | tunable | `1` | Wait for keepalive ping ack. |
@@ -158,15 +161,20 @@ Example `config/grpc-public.json`:
 | `tls_ca_file` | setting | _(empty)_ | CA PEM to verify the **server** certificate. Empty + `insecure: false` uses system roots. |
 | `tls_cert_file` / `tls_key_file` | setting | _(empty)_ | Client certificate pair for mTLS (must be set together). |
 | `tls_server_name` | setting | _(empty)_ | TLS ServerName (SNI / hostname check). Often needed when dialing by IP. |
-| `tls_insecure_skip_verify` | switch | `false` | Skip server cert verify (lab only). |
+| `tls_insecure_skip_verify` | switch | `false` | Skip server cert verify. Lab only. Error log + `grpc_client_tls_insecure_skip_verify=1`. Never production Path B. |
 
-**Plaintext vs TLS (client):** default `insecure: true` is local plaintext. For TLS set `insecure: false` (and usually `tls_ca_file`), or set TLS PEM paths (that alone flips to secure dial unless `insecure: true` is set explicitly — which is rejected).
+TLS **is implemented** (`tls.go`). Setting TLS PEM paths with `insecure`
+omitted flips the client to a secure dial. Explicit `insecure: true` plus
+TLS files is rejected.
 
-Example — local process (laptop / `go run`):
+### Laptop / `go run` (plaintext)
+
+Loopback to a process on the same machine. `insecure: true` stays available
+on purpose. This is **not** a cluster path.
 
 ```json
 {
-  "target": "127.0.0.1:9099",
+  "target": "127.0.0.1:8100",
   "insecure": true,
   "connect_timeout_sec": 5,
   "degraded_mode": false,
@@ -174,12 +182,17 @@ Example — local process (laptop / `go run`):
 }
 ```
 
-Example — in-cluster peer (Kubernetes Service in the **same namespace**; cluster
-DNS short name resolves to that Service’s ClusterIP):
+### Path A — mesh TLS (recommended when Istio/Linkerd is on)
+
+The client still uses `insecure: true` (h2c to the sidecar). The **mesh**
+encrypts on the wire. Name it **mesh** so a junior does not copy this JSON
+onto a cluster that has no sidecar and think they skipped TLS on purpose.
+
+Kubernetes Service in the **same namespace** (short name → ClusterIP):
 
 ```json
 {
-  "target": "peer-api:9099",
+  "target": "peer-api:8100",
   "insecure": true,
   "connect_timeout_sec": 5,
   "degraded_mode": false,
@@ -187,8 +200,60 @@ DNS short name resolves to that Service’s ClusterIP):
 }
 ```
 
-Same Service from another namespace uses the FQDN form instead, e.g.
-`peer-api.tenant-a.svc.cluster.local:9099`.
+Same Service from another namespace uses the FQDN, e.g.
+`peer-api.tenant-a.svc.cluster.local:8100`.
+
+Wrong: one in-cluster snippet with `insecure: true` that looks like Path B
+(app TLS) but is actually Path A (or worse: plaintext with no mesh).
+
+Right: Path A says “mesh encrypts”; Path B says `insecure: false` and PEM.
+
+### Path B — app TLS
+
+No mesh (or you want encryption inside the mesh too). Client sets
+`insecure: false` and usually `tls_ca_file`. Set `tls_server_name` when
+dialing by IP so the hostname check matches the certificate.
+
+```json
+{
+  "target": "peer-api:8100",
+  "insecure": false,
+  "tls_ca_file": "/var/run/secrets/caerus/grpc-ca.pem",
+  "tls_server_name": "peer-api.tenant-a.svc.cluster.local",
+  "connect_timeout_sec": 5,
+  "degraded_mode": false,
+  "health_when_degraded": "not_ready"
+}
+```
+
+Matching **server** Path B (PEM pair; optional mTLS):
+
+```json
+{
+  "bind": ":8100",
+  "tls_cert_file": "/var/run/secrets/caerus/grpc-server.pem",
+  "tls_key_file": "/var/run/secrets/caerus/grpc-server-key.pem",
+  "tls_ca_file": "/var/run/secrets/caerus/grpc-client-ca.pem",
+  "tls_client_auth": "require_and_verify",
+  "shutdown_timeout_sec": 10,
+  "restart_policy": "handled"
+}
+```
+
+Omit `tls_ca_file` / `tls_client_auth` when you want server TLS without
+client certificates. `tls_client_auth=require_and_verify` needs the CA.
+
+### `tls_insecure_skip_verify` (lab only)
+
+This is a different switch from `insecure`. `insecure: true` is plaintext.
+Skip-verify is “HTTPS/gRPC-TLS, but do not check the certificate” — MITM
+can present any cert. Error log plus `grpc_client_tls_insecure_skip_verify`
+on `/metrics`. Dashboards should alert when that gauge is `1`.
+
+Wrong: Path B plus `tls_insecure_skip_verify: true` on a serve pod.
+
+Right: Path B verifies the server cert (PEM CA or system roots). Skip-verify
+is laptop MITM debugging only.
 
 Client **DegradedMode** matches
 [`caerus-framework-valkey`](https://github.com/caerus-framework/caerus-framework-valkey)
@@ -207,7 +272,7 @@ Client **DegradedMode** matches
 | `WithClientDegradedMode` | client | soft Init on dial failure |
 | `WithClientTLS` | client | PEM CA / optional client cert+key; sets secure dial |
 | `WithTLSServerName` | client | SNI / cert hostname |
-| `WithTLSInsecureSkipVerify` | client | lab-only skip verify |
+| `WithTLSInsecureSkipVerify` | client | lab-only skip verify (error log + gauge) |
 | `WithServerTLS` | server | PEM cert+key |
 | `WithServerTLSClientCA` | server | mTLS client CA (+ require_and_verify) |
 | `WithConnectTimeout` | client | Ready wait |
