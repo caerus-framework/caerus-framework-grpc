@@ -103,8 +103,9 @@ func WithTarget(target string) ClientOption {
 	return func(o *clientOptions) { o.target = target }
 }
 
-// WithInsecure uses plaintext credentials (default true for local use).
-// Cannot be combined with TLS files; set false for TLS (system roots and/or PEM).
+// WithInsecure uses plaintext credentials (default true for laptop / go run).
+// Path A (mesh) also uses true (sidecar encrypts). Path B (app TLS) is false.
+// Cannot be combined with TLS files.
 func WithInsecure(enabled bool) ClientOption {
 	return func(o *clientOptions) { o.insecure = enabled }
 }
@@ -127,6 +128,7 @@ func WithTLSServerName(name string) ClientOption {
 }
 
 // WithTLSInsecureSkipVerify skips server certificate verification (lab only).
+// Init and reload log at error and expose grpc_client_tls_insecure_skip_verify=1.
 func WithTLSInsecureSkipVerify(skip bool) ClientOption {
 	return func(o *clientOptions) { o.tlsInsecureSkipVerify = skip }
 }
@@ -192,6 +194,7 @@ type Client struct {
 	degradedModeUses    atomic.Uint64
 	reconnects          atomic.Uint64
 	connectFailures     atomic.Uint64
+	tlsSkipVerifyOn     atomic.Bool
 }
 
 // NewClient creates an inert gRPC client component. Dial happens at Init.
@@ -301,6 +304,7 @@ func (c *Client) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 		c.unsubscribeLogs()
 		return errors.New("cf_grpc: client target is required")
 	}
+	c.screamTLSInsecureLocked()
 
 	conn, err := c.dialLocked()
 	if err != nil {
@@ -377,6 +381,7 @@ func (c *Client) OnConfigReload(source string, cfg any) {
 	}
 	prevTarget := c.target
 	c.applyClientConfig(*loaded)
+	c.screamTLSInsecureLocked()
 	if strings.TrimSpace(c.target) == "" {
 		c.logger.Error("cf_grpc: client reload ignored; empty target", "source", source)
 		c.target = prevTarget
@@ -442,12 +447,17 @@ func (c *Client) Metrics() []cf_observability.Metric {
 	if c.degradedUnreachable.Load() {
 		degraded = 1
 	}
+	skipVerify := 0.0
+	if c.tlsSkipVerifyOn.Load() {
+		skipVerify = 1
+	}
 	return []cf_observability.Metric{
 		{Name: "grpc_client_connected", Help: "1 when the client has a Ready connection.", Value: connected, Labels: map[string]string{"component": c.Name()}},
 		{Name: "grpc_client_degraded_unreachable", Help: "1 when running without a Ready connection under DegradedMode.", Value: degraded, Labels: map[string]string{"component": c.Name()}},
 		{Name: "grpc_client_degraded_mode_uses_total", Help: "Times Init continued after a failed connect because DegradedMode was enabled.", Value: float64(c.degradedModeUses.Load()), Labels: map[string]string{"component": c.Name()}},
 		{Name: "grpc_client_reconnects_total", Help: "Successful client reconnects after config reload.", Value: float64(c.reconnects.Load()), Labels: map[string]string{"component": c.Name()}},
 		{Name: "grpc_client_connect_failures_total", Help: "Failed dial or ready-wait attempts.", Value: float64(c.connectFailures.Load()), Labels: map[string]string{"component": c.Name()}},
+		{Name: "grpc_client_tls_insecure_skip_verify", Help: "1 when tls_insecure_skip_verify is on (lab only; RPCs are MITM-able).", Value: skipVerify, Labels: map[string]string{"component": c.Name()}},
 	}
 }
 
@@ -471,6 +481,19 @@ func (c *Client) unsubscribeLogs() {
 		c.logsSub.Unsubscribe()
 		c.logsSub = nil
 	}
+}
+
+// screamTLSInsecureLocked logs at error when skip-verify is on. Callers must
+// hold c.mu. Same bar as DegradedMode: operators must see this on day-one
+// dashboards, not only in a README footnote.
+func (c *Client) screamTLSInsecureLocked() {
+	c.tlsSkipVerifyOn.Store(c.tlsInsecureSkipVerify)
+	if !c.tlsInsecureSkipVerify {
+		return
+	}
+	c.logger.Error("cf_grpc: tls_insecure_skip_verify is on — server cert is not verified; RPCs are MITM-able. Lab only. Never production Path B (app TLS).",
+		"component", c.Name(),
+	)
 }
 
 func (c *Client) applyClientConfigFromSource() error {

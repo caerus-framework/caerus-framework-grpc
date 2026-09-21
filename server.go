@@ -25,6 +25,10 @@ const (
 	ServerComponentName = "grpc-server"
 	// ServerComponentStage is the serving plane (same idea as cf_http).
 	ServerComponentStage = cf.Stage("app")
+	// DefaultServerBind is the copy-paste listen address. It is not :9090
+	// (observability shop window) and not :8080 (HTTP). A second named
+	// server uses :8101, then :8102.
+	DefaultServerBind = ":8100"
 )
 
 // RestartPolicy controls behavior when server bind settings change on reload.
@@ -98,7 +102,7 @@ func WithServerConfigSource(name, path string, opts ...SourceOption) ServerOptio
 	}
 }
 
-// WithBind sets the listen address (host:port).
+// WithBind sets the listen address (host:port). Default is DefaultServerBind.
 func WithBind(addr string) ServerOption {
 	return func(o *serverOptions) { o.bind = addr }
 }
@@ -187,7 +191,7 @@ type Server struct {
 // NewServer creates an inert gRPC server component. It does not bind a port.
 func NewServer(opts ...ServerOption) *Server {
 	o := serverOptions{
-		bind:              ":9090",
+		bind:              DefaultServerBind,
 		shutdownTimeout:   10 * time.Second,
 		keepaliveTime:     2 * time.Hour,
 		keepaliveTimeout:  20 * time.Second,
