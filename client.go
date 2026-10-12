@@ -20,10 +20,12 @@ import (
 	cf_logs "github.com/caerus-framework/caerus-framework-logs"
 	cf_observability "github.com/caerus-framework/caerus-framework-observability"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -195,6 +197,8 @@ type Client struct {
 	reconnects          atomic.Uint64
 	connectFailures     atomic.Uint64
 	tlsSkipVerifyOn     atomic.Bool
+
+	calls *callStats
 }
 
 // NewClient creates an inert gRPC client component. Dial happens at Init.
@@ -233,6 +237,7 @@ func NewClient(opts ...ClientOption) *Client {
 		loggerSet:             o.loggerSet,
 	}
 	c.facade = &liveConn{c: c}
+	c.calls = newCallStats()
 	if o.loaded != nil {
 		c.applyClientConfig(*o.loaded)
 	}
@@ -451,7 +456,7 @@ func (c *Client) Metrics() []cf_observability.Metric {
 	if c.tlsSkipVerifyOn.Load() {
 		skipVerify = 1
 	}
-	return []cf_observability.Metric{
+	out := []cf_observability.Metric{
 		{Name: "grpc_client_connected", Help: "1 when the client has a Ready connection.", Value: connected, Labels: map[string]string{"component": c.Name()}},
 		{Name: "grpc_client_degraded_unreachable", Help: "1 when running without a Ready connection under DegradedMode.", Value: degraded, Labels: map[string]string{"component": c.Name()}},
 		{Name: "grpc_client_degraded_mode_uses_total", Help: "Times Init continued after a failed connect because DegradedMode was enabled.", Value: float64(c.degradedModeUses.Load()), Labels: map[string]string{"component": c.Name()}},
@@ -459,6 +464,7 @@ func (c *Client) Metrics() []cf_observability.Metric {
 		{Name: "grpc_client_connect_failures_total", Help: "Failed dial or ready-wait attempts.", Value: float64(c.connectFailures.Load()), Labels: map[string]string{"component": c.Name()}},
 		{Name: "grpc_client_tls_insecure_skip_verify", Help: "1 when tls_insecure_skip_verify is on (lab only; RPCs are MITM-able).", Value: skipVerify, Labels: map[string]string{"component": c.Name()}},
 	}
+	return append(out, c.calls.metrics(c.Name())...)
 }
 
 // Shutdown closes the underlying connection and unsubscribes from logs.
@@ -659,19 +665,28 @@ type liveConn struct {
 }
 
 func (l *liveConn) Invoke(ctx context.Context, method string, args any, reply any, opts ...grpc.CallOption) error {
+	start := time.Now()
 	conn := l.c.UnderlyingConn()
 	if conn == nil {
-		return errors.New("cf_grpc: client not connected")
+		err := status.Error(codes.Unavailable, "cf_grpc: client not connected")
+		l.c.calls.observe(method, status.Code(err), time.Since(start), true)
+		return err
 	}
-	return conn.Invoke(ctx, method, args, reply, opts...)
+	err := conn.Invoke(ctx, method, args, reply, opts...)
+	l.c.calls.observe(method, status.Code(err), time.Since(start), true)
+	return err
 }
 
 func (l *liveConn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 	conn := l.c.UnderlyingConn()
 	if conn == nil {
-		return nil, errors.New("cf_grpc: client not connected")
+		err := status.Error(codes.Unavailable, "cf_grpc: client not connected")
+		l.c.calls.observe(method, status.Code(err), 0, false)
+		return nil, err
 	}
-	return conn.NewStream(ctx, desc, method, opts...)
+	stream, err := conn.NewStream(ctx, desc, method, opts...)
+	l.c.calls.observe(method, status.Code(err), 0, false)
+	return stream, err
 }
 
 var _ cf.CaerusComponent = (*Client)(nil)

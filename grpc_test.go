@@ -125,6 +125,14 @@ func TestServerClientRoundTrip(t *testing.T) {
 	if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
 		t.Fatalf("status = %v", resp.GetStatus())
 	}
+	got := metricWithLabels(t, cli.Metrics(), "grpc_client_calls_total", map[string]string{
+		"grpc_service": "Health",
+		"method":       "Check",
+		"code":         "OK",
+	})
+	if got != 1 {
+		t.Fatalf("Check calls = %v, want 1", got)
+	}
 
 	cancel()
 	select {
