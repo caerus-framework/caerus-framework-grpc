@@ -158,6 +158,7 @@ HTTP stays `:8080`. Do not reuse those numbers for gRPC in the same process.
 | `keepalive_timeout_sec` | tunable | `1` | Wait for keepalive ping ack. |
 | `degraded_mode` | switch | `false` | When true, failed dial / Ready wait does **not** abort `Init` (hard-fail when off). Same idea as `cf_valkey`. |
 | `health_when_degraded` | setting | `not_ready` | While disconnected under DegradedMode: `not_ready` (`Health` fails → `/readyz` 503) or `ready` (break-glass LB traffic). |
+| `reconnect_interval_sec` | tunable | `300` | How often `Run` tries the dial again after DegradedMode left the client with no connection. Five minutes. |
 | `tls_ca_file` | setting | _(empty)_ | CA PEM to verify the **server** certificate. Empty + `insecure: false` uses system roots. |
 | `tls_cert_file` / `tls_key_file` | setting | _(empty)_ | Client certificate pair for mTLS (must be set together). |
 | `tls_server_name` | setting | _(empty)_ | TLS ServerName (SNI / hostname check). Often needed when dialing by IP. |
@@ -260,6 +261,15 @@ Client **DegradedMode** matches
 (`cf_valkey`): Init may succeed without Ready; `/readyz` stays red unless
 `health_when_degraded: ready`.
 
+When that Init leaves the client with no connection, `Run` tries the dial
+again every `reconnect_interval_sec` (default 300 seconds, five minutes)
+until one attempt reaches Ready or the process stops. The first retry waits
+one full interval; Init itself was the first attempt. A job never calls
+`Run`, so a migrate process does not keep dialing. A connection that already
+exists and later drops is reconnected by the gRPC library; this interval
+covers only the nil-connection case. A successful retry sets the connection
+the typed stub already holds, so the next RPC uses it.
+
 ## Options (construct-time)
 
 | Option | Applies to | Meaning |
@@ -270,6 +280,7 @@ Client **DegradedMode** matches
 | `WithServerName` / `WithClientName` | both | component `Name()` |
 | `WithServerLogger` / `WithClientLogger` | both | explicit logger |
 | `WithClientDegradedMode` | client | soft Init on dial failure |
+| `WithReconnectInterval` | client | how often `Run` retries a nil DegradedMode connection (default five minutes) |
 | `WithClientTLS` | client | PEM CA / optional client cert+key; sets secure dial |
 | `WithTLSServerName` | client | SNI / cert hostname |
 | `WithTLSInsecureSkipVerify` | client | lab-only skip verify (error log + gauge) |
