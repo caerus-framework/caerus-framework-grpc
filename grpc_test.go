@@ -3,6 +3,7 @@ package cf_grpc
 import (
 	"context"
 	"log/slog"
+	"net"
 	"testing"
 	"time"
 
@@ -158,5 +159,77 @@ func TestClientDegradedMode(t *testing.T) {
 	t.Cleanup(func() { _ = cli.Shutdown(context.Background()) })
 	if err := cli.Health(context.Background()); err == nil {
 		t.Fatal("Health should fail when not connected and health_when_degraded=not_ready")
+	}
+	if cli.UnderlyingConn() != nil {
+		t.Fatal("DegradedMode Init should leave no connection")
+	}
+}
+
+func TestClientDegradedModeReconnects(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+
+	cli := NewClient(
+		WithTarget(addr),
+		WithConnectTimeout(200*time.Millisecond),
+		WithReconnectInterval(50*time.Millisecond),
+		WithClientDegradedMode(true),
+		WithClientLogger(slog.Default()),
+	)
+	if err := cli.Init(context.Background(), cf.New()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Shutdown(context.Background()) })
+	if cli.UnderlyingConn() != nil {
+		t.Fatal("Init reached Ready before the server was serving")
+	}
+
+	gs := grpc.NewServer()
+	hs := health.NewServer()
+	hs.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+	healthpb.RegisterHealthServer(gs, hs)
+	go func() { _ = gs.Serve(ln) }()
+	t.Cleanup(gs.Stop)
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- cli.Run(runCtx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cli.UnderlyingConn() != nil && cli.Health(context.Background()) == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if cli.UnderlyingConn() == nil {
+		t.Fatal("Run did not store a connection")
+	}
+	if err := cli.Health(context.Background()); err != nil {
+		t.Fatalf("Health after reconnect: %v", err)
+	}
+	hc := healthpb.NewHealthClient(cli.Conn())
+	resp, err := hc.Check(context.Background(), &healthpb.HealthCheckRequest{})
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if resp.GetStatus() != healthpb.HealthCheckResponse_SERVING {
+		t.Fatalf("status = %v", resp.GetStatus())
+	}
+	if got := cli.reconnects.Load(); got < 1 {
+		t.Fatalf("reconnects = %d, want at least 1", got)
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return")
 	}
 }

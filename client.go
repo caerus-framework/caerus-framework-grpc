@@ -33,19 +33,25 @@ const (
 	ClientComponentName = "grpc-client"
 	// ClientComponentStage is the data plane (outbound store-like peer).
 	ClientComponentStage = cf.Stage("data")
+	// defaultClientReconnectInterval is how often Run retries a DegradedMode
+	// dial that left the client with no connection.
+	defaultClientReconnectInterval = 5 * time.Minute
 )
 
 // ClientConfig is file/env settings for one gRPC client instance.
 // No field flag tags: multiple clients share a process flag namespace; use
 // per-source EnvPrefix and the --<source-name> path override instead.
 type ClientConfig struct {
-	Target                string   `json:"target,omitempty" yaml:"target,omitempty" env:"TARGET"`
-	Insecure              *bool    `json:"insecure,omitempty" yaml:"insecure,omitempty" env:"INSECURE"`
-	ConnectTimeoutSec     *float64 `json:"connect_timeout_sec,omitempty" yaml:"connect_timeout_sec,omitempty" env:"CONNECT_TIMEOUT_SEC"`
-	KeepaliveTimeSec      *float64 `json:"keepalive_time_sec,omitempty" yaml:"keepalive_time_sec,omitempty" env:"KEEPALIVE_TIME_SEC"`
-	KeepaliveTimeoutSec   *float64 `json:"keepalive_timeout_sec,omitempty" yaml:"keepalive_timeout_sec,omitempty" env:"KEEPALIVE_TIMEOUT_SEC"`
-	DegradedMode          *bool    `json:"degraded_mode,omitempty" yaml:"degraded_mode,omitempty" env:"DEGRADED_MODE"`
-	HealthWhenDegraded    string   `json:"health_when_degraded,omitempty" yaml:"health_when_degraded,omitempty" env:"HEALTH_WHEN_DEGRADED"`
+	Target              string   `json:"target,omitempty" yaml:"target,omitempty" env:"TARGET"`
+	Insecure            *bool    `json:"insecure,omitempty" yaml:"insecure,omitempty" env:"INSECURE"`
+	ConnectTimeoutSec   *float64 `json:"connect_timeout_sec,omitempty" yaml:"connect_timeout_sec,omitempty" env:"CONNECT_TIMEOUT_SEC"`
+	KeepaliveTimeSec    *float64 `json:"keepalive_time_sec,omitempty" yaml:"keepalive_time_sec,omitempty" env:"KEEPALIVE_TIME_SEC"`
+	KeepaliveTimeoutSec *float64 `json:"keepalive_timeout_sec,omitempty" yaml:"keepalive_timeout_sec,omitempty" env:"KEEPALIVE_TIMEOUT_SEC"`
+	DegradedMode        *bool    `json:"degraded_mode,omitempty" yaml:"degraded_mode,omitempty" env:"DEGRADED_MODE"`
+	HealthWhenDegraded  string   `json:"health_when_degraded,omitempty" yaml:"health_when_degraded,omitempty" env:"HEALTH_WHEN_DEGRADED"`
+	// ReconnectIntervalSec is how often Run retries a dial after DegradedMode
+	// left the client with no connection. Default is 300 (five minutes).
+	ReconnectIntervalSec  *float64 `json:"reconnect_interval_sec,omitempty" yaml:"reconnect_interval_sec,omitempty" env:"RECONNECT_INTERVAL_SEC"`
 	TLSCAFile             string   `json:"tls_ca_file,omitempty" yaml:"tls_ca_file,omitempty" env:"TLS_CA_FILE"`
 	TLSCertFile           string   `json:"tls_cert_file,omitempty" yaml:"tls_cert_file,omitempty" env:"TLS_CERT_FILE"`
 	TLSKeyFile            string   `json:"tls_key_file,omitempty" yaml:"tls_key_file,omitempty" env:"TLS_KEY_FILE"`
@@ -70,6 +76,7 @@ type clientOptions struct {
 	keepaliveTimeout      time.Duration
 	degradedMode          bool
 	healthWhenDegraded    string
+	reconnectInterval     time.Duration
 	tlsCAFile             string
 	tlsCertFile           string
 	tlsKeyFile            string
@@ -158,6 +165,20 @@ func WithClientDegradedMode(enabled bool) ClientOption {
 	return func(o *clientOptions) { o.degradedMode = enabled }
 }
 
+// WithReconnectInterval sets how often Run retries a dial after DegradedMode
+// left the client with no connection. The default is five minutes. A
+// non-positive duration is ignored and the default is kept.
+//
+// This interval is only for the nil-connection case. An existing
+// ClientConn that later drops is reconnected by the gRPC library itself.
+func WithReconnectInterval(d time.Duration) ClientOption {
+	return func(o *clientOptions) {
+		if d > 0 {
+			o.reconnectInterval = d
+		}
+	}
+}
+
 // Client is one outbound gRPC connection peer.
 type Client struct {
 	mu sync.Mutex
@@ -175,6 +196,7 @@ type Client struct {
 	keepaliveTimeout      time.Duration
 	degradedMode          bool
 	healthWhenDegraded    string
+	reconnectInterval     time.Duration
 	tlsCAFile             string
 	tlsCertFile           string
 	tlsKeyFile            string
@@ -227,6 +249,7 @@ func NewClient(opts ...ClientOption) *Client {
 		keepaliveTimeout:      o.keepaliveTimeout,
 		degradedMode:          o.degradedMode,
 		healthWhenDegraded:    normalizeHealthWhenDegraded(o.healthWhenDegraded),
+		reconnectInterval:     o.reconnectInterval,
 		tlsCAFile:             o.tlsCAFile,
 		tlsCertFile:           o.tlsCertFile,
 		tlsKeyFile:            o.tlsKeyFile,
@@ -240,6 +263,9 @@ func NewClient(opts ...ClientOption) *Client {
 	c.calls = newCallStats()
 	if o.loaded != nil {
 		c.applyClientConfig(*o.loaded)
+	}
+	if c.reconnectInterval <= 0 {
+		c.reconnectInterval = defaultClientReconnectInterval
 	}
 	return c
 }
@@ -326,6 +352,7 @@ func (c *Client) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 			"err", err,
 			"target", c.target,
 			"health_when_degraded", c.healthWhenDegraded,
+			"retry_interval", c.reconnectInterval.String(),
 		)
 		return nil
 	}
@@ -344,6 +371,7 @@ func (c *Client) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 			"err", err,
 			"target", c.target,
 			"health_when_degraded", c.healthWhenDegraded,
+			"retry_interval", c.reconnectInterval.String(),
 		)
 		return nil
 	}
@@ -353,6 +381,96 @@ func (c *Client) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 	c.initialized = true
 	c.logger.Info("cf_grpc: client initialized", "target", c.target)
 	return nil
+}
+
+// Run retries a DegradedMode dial that left the client with no connection.
+// The first retry waits reconnectInterval (default five minutes), then each
+// later failure waits that long again. A client that already has a connection
+// just waits until ctx is canceled: the gRPC library reconnects that
+// connection on its own. Jobs never call Run, so a one-shot process does not
+// keep dialing.
+func (c *Client) Run(ctx context.Context) error {
+	announced := false
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !c.shouldRetryDial() {
+			<-ctx.Done()
+			return nil
+		}
+		interval := c.currentReconnectInterval()
+		if !announced {
+			announced = true
+			c.logger.Info("cf_grpc: DegradedMode — no connection; Run retries the dial",
+				"interval", interval.String(),
+				"target", c.dialTarget(),
+			)
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+		c.tryReconnect(ctx)
+	}
+}
+
+func (c *Client) shouldRetryDial() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.initialized && c.degradedMode && c.conn == nil && c.reconnectInterval > 0
+}
+
+func (c *Client) currentReconnectInterval() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.reconnectInterval <= 0 {
+		return defaultClientReconnectInterval
+	}
+	return c.reconnectInterval
+}
+
+func (c *Client) dialTarget() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.target
+}
+
+// tryReconnect dials once. Callers must not hold c.mu. A failed attempt
+// leaves the previous connection (often nil) in place.
+func (c *Client) tryReconnect(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.initialized || !c.degradedMode || c.conn != nil {
+		return
+	}
+	conn, err := c.dialLocked()
+	if err != nil {
+		c.connectFailures.Add(1)
+		c.logger.Error("cf_grpc: DegradedMode reconnect dial failed", "err", err, "target", c.target)
+		return
+	}
+	if err := c.waitReadyLocked(ctx, conn); err != nil {
+		_ = conn.Close()
+		c.connectFailures.Add(1)
+		c.logger.Error("cf_grpc: DegradedMode reconnect failed", "err", err, "target", c.target)
+		return
+	}
+	if ctx.Err() != nil || !c.initialized || c.conn != nil {
+		_ = conn.Close()
+		return
+	}
+	c.conn = conn
+	c.liveConnected.Store(true)
+	c.degradedUnreachable.Store(false)
+	c.reconnects.Add(1)
+	c.logger.Info("cf_grpc: client reconnected", "target", c.target)
 }
 
 // Conn returns a stable grpc.ClientConnInterface that always forwards to the
@@ -460,7 +578,7 @@ func (c *Client) Metrics() []cf_observability.Metric {
 		{Name: "grpc_client_connected", Help: "1 when the client has a Ready connection.", Value: connected, Labels: map[string]string{"component": c.Name()}},
 		{Name: "grpc_client_degraded_unreachable", Help: "1 when running without a Ready connection under DegradedMode.", Value: degraded, Labels: map[string]string{"component": c.Name()}},
 		{Name: "grpc_client_degraded_mode_uses_total", Help: "Times Init continued after a failed connect because DegradedMode was enabled.", Value: float64(c.degradedModeUses.Load()), Labels: map[string]string{"component": c.Name()}},
-		{Name: "grpc_client_reconnects_total", Help: "Successful client reconnects after config reload.", Value: float64(c.reconnects.Load()), Labels: map[string]string{"component": c.Name()}},
+		{Name: "grpc_client_reconnects_total", Help: "Successful client reconnects after a DegradedMode retry or a config reload.", Value: float64(c.reconnects.Load()), Labels: map[string]string{"component": c.Name()}},
 		{Name: "grpc_client_connect_failures_total", Help: "Failed dial or ready-wait attempts.", Value: float64(c.connectFailures.Load()), Labels: map[string]string{"component": c.Name()}},
 		{Name: "grpc_client_tls_insecure_skip_verify", Help: "1 when tls_insecure_skip_verify is on (lab only; RPCs are MITM-able).", Value: skipVerify, Labels: map[string]string{"component": c.Name()}},
 	}
@@ -536,6 +654,9 @@ func (c *Client) applyClientConfig(cfg ClientConfig) {
 	}
 	if cfg.HealthWhenDegraded != "" {
 		c.healthWhenDegraded = normalizeHealthWhenDegraded(cfg.HealthWhenDegraded)
+	}
+	if cfg.ReconnectIntervalSec != nil {
+		c.reconnectInterval = time.Duration(*cfg.ReconnectIntervalSec * float64(time.Second))
 	}
 	if cfg.TLSCAFile != "" {
 		c.tlsCAFile = cfg.TLSCAFile
@@ -615,9 +736,10 @@ func (c *Client) waitReadyLocked(ctx context.Context, conn *grpc.ClientConn) err
 
 func validateClientConfig(cfg *ClientConfig) error {
 	for name, value := range map[string]*float64{
-		"connect_timeout_sec":   cfg.ConnectTimeoutSec,
-		"keepalive_time_sec":    cfg.KeepaliveTimeSec,
-		"keepalive_timeout_sec": cfg.KeepaliveTimeoutSec,
+		"connect_timeout_sec":    cfg.ConnectTimeoutSec,
+		"keepalive_time_sec":     cfg.KeepaliveTimeSec,
+		"keepalive_timeout_sec":  cfg.KeepaliveTimeoutSec,
+		"reconnect_interval_sec": cfg.ReconnectIntervalSec,
 	} {
 		if value != nil {
 			if err := validateSeconds(name, *value, true); err != nil {
@@ -695,4 +817,5 @@ var _ cf.HealthProvider = (*Client)(nil)
 var _ cf_observability.MetricsProvider = (*Client)(nil)
 var _ cf.ConfigReloader = (*Client)(nil)
 var _ cf.ConfigSourceRegistrar = (*Client)(nil)
+var _ cf.Runnable = (*Client)(nil)
 var _ grpc.ClientConnInterface = (*liveConn)(nil)
